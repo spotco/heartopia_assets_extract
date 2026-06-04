@@ -9,6 +9,7 @@ Python scripts for evaluating and extracting Heartopia audio assets, adapted fro
 - `scripts\name_unnamed_music_from_banks.py`
 - `scripts\analyze_unnamed_audio.py`
 - `scripts\export_named_music.py`
+- `scripts\inspect_map_music_bundle.py`
 - `scripts\heartopia_wwise.py`
 - `NOTES.md`
 
@@ -44,5 +45,7 @@ The scripts currently default to:
    - `python .\scripts\name_unnamed_music_from_banks.py`
 4. Analyze candidates:
    - `python .\scripts\analyze_unnamed_audio.py`
-5. Export playable files:
+5. Inspect encrypted map-music metadata bundles when bank names are too generic:
+   - `python .\scripts\inspect_map_music_bundle.py --key 27v8HxLIptguw3Jn`
+6. Export playable files:
    - `python .\scripts\export_named_music.py --overwrite`
