@@ -17,6 +17,16 @@
 - `Music_metronome__171652715.wem`
 - `Music_metronome__615181053.wem`
 
+## Current naming status
+
+- The audio extraction and unique-name goal is effectively solved: 677 playable MP3s were exported, and every usable generic bank entry now has a stable media-ID-based label such as `map_music_403211966_403211966.mp3`.
+- The remaining gap is semantic/human-readable naming for generic banks, especially `Mus_map`. About half of the music candidates have specific bank-derived names, but 340 of 681 candidate rows still use `generic_bank_type_media_id`; 202 are pure `map_music`.
+- The longest likely music tracks are mostly `map_music`, so better names now depend on Unity/game metadata rather than more Wwise bank parsing.
+- The strongest metadata target is `xdt_Data\StreamingAssets\AssetBundle\27041feea928_mainlevelconfig_1.ab`, because it is more likely than the prefab bundle to contain map/audio assignment data.
+- The recovered Unity asset-bundle key `27v8HxLIptguw3Jn` should be treated as settled. It is already verified, so further progress should focus on the post-key payload transform or loader logic.
+- The highest-leverage next lead is decoding the `XDENCODE0001` wrapped managed assemblies. If those can be restored to normal PE DLLs, they may expose `LoadSAFile`, `GetDecryptedData`, or the exact custom resource/bundle decode path.
+- Blind block-probing in `scripts\inspect_map_music_bundle.py` has produced useful diagnostics, but is likely near diminishing returns unless guided by recovered loader code.
+
 ## Exported audio names
 
 ```text

@@ -3,14 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import UnityPy
 from UnityPy.files.BundleFile import ArchiveFlags, ArchiveFlagsOld
 from UnityPy.helpers import ArchiveStorageManager as asm
 from UnityPy.helpers.CompressionHelper import DECOMPRESSION_MAP
 from UnityPy.streams import EndianBinaryReader
+
+try:
+    from Crypto.Cipher import AES
+except ImportError:  # pragma: no cover - optional diagnostics dependency
+    AES = None
 
 from heartopia_wwise import DEFAULT_GAME_ROOT
 
@@ -23,6 +29,10 @@ DEFAULT_BUNDLES = (
 )
 DEFAULT_JSON_OUT = Path("reports/map_music_bundle_inspection.json")
 DEFAULT_TEXT_OUT = Path("reports/map_music_bundle_inspection.txt")
+DEFAULT_BLOCK_PROBE_LIMIT = 5
+
+
+BlockStrategy = Callable[[bytes, int, int, int], bytes]
 
 
 def parse_version_tuple(text: str) -> tuple[int, ...]:
@@ -82,7 +92,97 @@ def read_bundle_header(bundle_path: Path) -> dict[str, Any]:
     }
 
 
-def parse_bundle_layout(bundle_path: Path, key: str) -> dict[str, Any]:
+def probe_block_payload(payload: bytes, compression_flag: int, uncompressed_size: int) -> dict[str, Any]:
+    try:
+        decompressed = DECOMPRESSION_MAP[compression_flag](payload, uncompressed_size)
+        return {
+            "status": "ok",
+            "decompressed_size": len(decompressed),
+            "head_hex": decompressed[:16].hex(),
+        }
+    except Exception as exc:  # pragma: no cover - diagnostics path
+        return {
+            "status": "error",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc).replace("\r", ""),
+        }
+
+
+def aes_decrypt_ecb(payload: bytes, key: bytes) -> bytes:
+    aligned_size = len(payload) // 16 * 16
+    if aligned_size == 0:
+        return payload
+    return AES.new(key, AES.MODE_ECB).decrypt(payload[:aligned_size]) + payload[aligned_size:]
+
+
+def aes_decrypt_cbc(payload: bytes, key: bytes, iv: bytes) -> bytes:
+    aligned_size = len(payload) // 16 * 16
+    if aligned_size == 0:
+        return payload
+    return AES.new(key, AES.MODE_CBC, iv=iv).decrypt(payload[:aligned_size]) + payload[aligned_size:]
+
+
+def build_block_probe_strategies(
+    decryptor: asm.ArchiveStorageDecryptor,
+    configured_key: str,
+) -> list[tuple[str, BlockStrategy]]:
+    strategies: list[tuple[str, BlockStrategy]] = [
+        ("raw", lambda raw, block_index, cumulative_uncompressed, cumulative_compressed: raw),
+        (
+            "unitypy_block_index",
+            lambda raw, block_index, cumulative_uncompressed, cumulative_compressed: decryptor.decrypt_block(raw, block_index),
+        ),
+        (
+            "unitypy_zero_index",
+            lambda raw, block_index, cumulative_uncompressed, cumulative_compressed: decryptor.decrypt_block(raw, 0),
+        ),
+        (
+            "unitypy_uncompressed_offset",
+            lambda raw, block_index, cumulative_uncompressed, cumulative_compressed: decryptor.decrypt_block(
+                raw,
+                cumulative_uncompressed,
+            ),
+        ),
+        (
+            "unitypy_compressed_offset",
+            lambda raw, block_index, cumulative_uncompressed, cumulative_compressed: decryptor.decrypt_block(
+                raw,
+                cumulative_compressed,
+            ),
+        ),
+    ]
+
+    key_bytes = configured_key.encode("utf-8")
+    if AES is None or len(key_bytes) not in (16, 24, 32):
+        return strategies
+
+    ivs = {
+        "data": decryptor.data[:16],
+        "data_sig": decryptor.data_sig[:16],
+        "key": decryptor.key[:16],
+        "zero": bytes(16),
+    }
+    strategies.append(
+        (
+            "aes_ecb_raw",
+            lambda raw, block_index, cumulative_uncompressed, cumulative_compressed: aes_decrypt_ecb(raw, key_bytes),
+        )
+    )
+    for iv_name, iv in ivs.items():
+        strategies.append(
+            (
+                f"aes_cbc_raw_{iv_name}",
+                lambda raw, block_index, cumulative_uncompressed, cumulative_compressed, iv=iv: aes_decrypt_cbc(
+                    raw,
+                    key_bytes,
+                    iv,
+                ),
+            )
+        )
+    return strategies
+
+
+def parse_bundle_layout(bundle_path: Path, key: str, block_probe_limit: int) -> dict[str, Any]:
     UnityPy.set_assetbundle_decrypt_key(key)
     reader = EndianBinaryReader(bundle_path.read_bytes())
     signature = reader.read_string_to_null()
@@ -131,26 +231,66 @@ def parse_bundle_layout(bundle_path: Path, key: str) -> dict[str, Any]:
         )
 
     block_attempts = []
-    success_count = 0
+    raw_success_count = 0
+    decrypted_success_count = 0
+    block_flag_counts: Counter[int] = Counter()
+    block_extra_flag_counts: Counter[int] = Counter()
+    block_compression_counts: Counter[int] = Counter()
+    strategy_success_counts: Counter[str] = Counter()
+    strategy_first_success: dict[str, dict[str, Any]] = {}
+    strategies = build_block_probe_strategies(decryptor, key)
+    cumulative_uncompressed = 0
+    cumulative_compressed = 0
     for index, block in enumerate(blocks):
         raw = reader.read_bytes(block["compressed_size"])
-        try:
-            decrypted = decryptor.decrypt_block(raw, index)
-            DECOMPRESSION_MAP[int(block["flags"] & ArchiveFlags.CompressionTypeMask)](
-                decrypted,
-                block["uncompressed_size"],
-            )
-            block_attempts.append({"index": index, "status": "ok"})
-            success_count += 1
-        except Exception as exc:  # pragma: no cover - diagnostics path
+        compression_flag = int(block["flags"] & ArchiveFlags.CompressionTypeMask)
+        extra_flags = int(block["flags"] & ~int(ArchiveFlags.CompressionTypeMask))
+        block_flag_counts[block["flags"]] += 1
+        block_extra_flag_counts[extra_flags] += 1
+        block_compression_counts[compression_flag] += 1
+
+        strategy_results: list[dict[str, Any]] = []
+        for strategy_name, strategy in strategies:
+            try:
+                transformed = strategy(raw, index, cumulative_uncompressed, cumulative_compressed)
+                result = probe_block_payload(transformed, compression_flag, block["uncompressed_size"])
+            except Exception as exc:  # pragma: no cover - diagnostics path
+                result = {
+                    "status": "error",
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc).replace("\r", ""),
+                }
+            strategy_entry = {"name": strategy_name, **result}
+            strategy_results.append(strategy_entry)
+            if result["status"] == "ok":
+                strategy_success_counts[strategy_name] += 1
+                if strategy_name not in strategy_first_success:
+                    strategy_first_success[strategy_name] = {
+                        "block_index": index,
+                        "head_hex": result.get("head_hex", ""),
+                    }
+
+        raw_probe = next(result for result in strategy_results if result["name"] == "raw")
+        decrypted_probe = next(result for result in strategy_results if result["name"] == "unitypy_block_index")
+        if raw_probe["status"] == "ok":
+            raw_success_count += 1
+        if decrypted_probe["status"] == "ok":
+            decrypted_success_count += 1
+
+        if index < block_probe_limit:
             block_attempts.append(
                 {
                     "index": index,
-                    "status": "error",
-                    "error_type": exc.__class__.__name__,
-                    "error": str(exc),
+                    "flags": block["flags"],
+                    "compression_flag": compression_flag,
+                    "extra_flags": extra_flags,
+                    "raw_probe": raw_probe,
+                    "decrypted_probe": decrypted_probe,
+                    "strategies": strategy_results,
                 }
             )
+        cumulative_uncompressed += block["uncompressed_size"]
+        cumulative_compressed += block["compressed_size"]
 
     try:
         env = UnityPy.load(str(bundle_path))
@@ -182,16 +322,38 @@ def parse_bundle_layout(bundle_path: Path, key: str) -> dict[str, Any]:
         "node_count": node_count,
         "blocks": blocks,
         "nodes": nodes,
+        "block_flag_summary": {
+            "flags": [{"value": value, "count": count} for value, count in sorted(block_flag_counts.items())],
+            "compression_flags": [
+                {"value": value, "count": count} for value, count in sorted(block_compression_counts.items())
+            ],
+            "extra_flags": [{"value": value, "count": count} for value, count in sorted(block_extra_flag_counts.items())],
+        },
         "manual_block_decompression": {
-            "successful_blocks": success_count,
+            "probe_limit": block_probe_limit,
+            "raw_successful_blocks": raw_success_count,
+            "decrypted_successful_blocks": decrypted_success_count,
             "total_blocks": len(blocks),
+            "strategy_summary": [
+                {
+                    "name": name,
+                    "successful_blocks": count,
+                    "first_success": strategy_first_success.get(name),
+                }
+                for name, count in sorted(strategy_success_counts.items(), key=lambda item: (-item[1], item[0]))
+            ],
             "attempts": block_attempts,
         },
         "unitypy_load": unitypy_status,
     }
 
 
-def inspect_bundle(bundle_path: Path, metadata_path: Path, configured_key: str | None) -> dict[str, Any]:
+def inspect_bundle(
+    bundle_path: Path,
+    metadata_path: Path,
+    configured_key: str | None,
+    block_probe_limit: int,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "bundle_path": str(bundle_path),
         "exists": bundle_path.exists(),
@@ -221,7 +383,7 @@ def inspect_bundle(bundle_path: Path, metadata_path: Path, configured_key: str |
         return result
 
     try:
-        result["parse"] = {"status": "ok", **parse_bundle_layout(bundle_path, key_to_use)}
+        result["parse"] = {"status": "ok", **parse_bundle_layout(bundle_path, key_to_use, block_probe_limit)}
     except Exception as exc:  # pragma: no cover - diagnostics path
         result["parse"] = {
             "status": "error",
@@ -258,8 +420,19 @@ def render_text_report(metadata_path: Path, inspections: list[dict[str, Any]]) -
         if parse.get("status") == "ok":
             lines.append(
                 f"  Layout: {parse['block_count']} blocks, {parse['node_count']} nodes, "
-                f"{parse['manual_block_decompression']['successful_blocks']} manually decompressed blocks"
+                f"{parse['manual_block_decompression']['decrypted_successful_blocks']} decrypted block payloads decompressed"
             )
+            flag_summary = parse.get("block_flag_summary", {})
+            flag_values = ", ".join(
+                f"0x{entry['value']:x} x{entry['count']}" for entry in flag_summary.get("flags", [])
+            )
+            extra_flag_values = ", ".join(
+                f"0x{entry['value']:x} x{entry['count']}" for entry in flag_summary.get("extra_flags", [])
+            )
+            if flag_values:
+                lines.append(f"  Block flags: {flag_values}")
+            if extra_flag_values:
+                lines.append(f"  Block extra flags: {extra_flag_values}")
             for node in parse["nodes"][:5]:
                 lines.append(f"    Node: {node['path']} (size={node['size']}, flags={node['flags']})")
             unitypy_load = parse["unitypy_load"]
@@ -271,11 +444,36 @@ def render_text_report(metadata_path: Path, inspections: list[dict[str, Any]]) -
                 lines.append(
                     f"  UnityPy load: {unitypy_load['error_type']}: {unitypy_load['error'].splitlines()[0]}"
                 )
-            failed = [attempt for attempt in parse["manual_block_decompression"]["attempts"] if attempt["status"] != "ok"]
-            if failed:
-                first = failed[0]
+            attempts = parse["manual_block_decompression"]["attempts"]
+            if attempts:
                 lines.append(
-                    f"  First block failure: block {first['index']} {first['error_type']}: {first['error']}"
+                    "  Block probes: "
+                    f"raw ok {parse['manual_block_decompression']['raw_successful_blocks']}/{parse['manual_block_decompression']['total_blocks']}, "
+                    f"decrypted ok {parse['manual_block_decompression']['decrypted_successful_blocks']}/{parse['manual_block_decompression']['total_blocks']}"
+                )
+            strategy_summary = parse["manual_block_decompression"].get("strategy_summary", [])
+            if strategy_summary:
+                lines.append("  Probe strategies with any successful LZ4 output:")
+                for entry in strategy_summary:
+                    first_success = entry.get("first_success") or {}
+                    lines.append(
+                        "    "
+                        f"{entry['name']}: {entry['successful_blocks']} blocks "
+                        f"(first block {first_success.get('block_index', '?')}, head={first_success.get('head_hex', '')})"
+                    )
+            raw_failed = [attempt for attempt in attempts if attempt["raw_probe"]["status"] != "ok"]
+            if raw_failed:
+                first = raw_failed[0]
+                lines.append(
+                    "  First raw block failure: "
+                    f"block {first['index']} {first['raw_probe']['error_type']}: {first['raw_probe']['error']}"
+                )
+            decrypted_failed = [attempt for attempt in attempts if attempt["decrypted_probe"]["status"] != "ok"]
+            if decrypted_failed:
+                first = decrypted_failed[0]
+                lines.append(
+                    "  First decrypted block failure: "
+                    f"block {first['index']} {first['decrypted_probe']['error_type']}: {first['decrypted_probe']['error']}"
                 )
         else:
             lines.append(f"  Error: {parse.get('error_type', '')}: {parse.get('error', '')}")
@@ -291,6 +489,12 @@ def main() -> int:
     parser.add_argument("--key", help="Known 16-byte Unity asset-bundle decryption key.")
     parser.add_argument("--json-out", type=Path, default=DEFAULT_JSON_OUT)
     parser.add_argument("--text-out", type=Path, default=DEFAULT_TEXT_OUT)
+    parser.add_argument(
+        "--block-probe-limit",
+        type=int,
+        default=DEFAULT_BLOCK_PROBE_LIMIT,
+        help="How many leading blocks to probe with both raw and decrypted decompression attempts.",
+    )
     args = parser.parse_args()
 
     metadata_path = (args.metadata_path or (args.game_root / DEFAULT_METADATA)).resolve()
@@ -303,7 +507,7 @@ def main() -> int:
         bundle_dir = (args.game_root / DEFAULT_BUNDLE_DIR).resolve()
         bundle_paths = [bundle_dir / name for name in DEFAULT_BUNDLES]
 
-    inspections = [inspect_bundle(bundle_path, metadata_path, args.key) for bundle_path in bundle_paths]
+    inspections = [inspect_bundle(bundle_path, metadata_path, args.key, args.block_probe_limit) for bundle_path in bundle_paths]
     payload = {
         "metadata_path": str(metadata_path),
         "bundles": inspections,
@@ -322,7 +526,7 @@ def main() -> int:
         if summary == "ok":
             summary = (
                 f"ok, {parse['block_count']} blocks, {parse['node_count']} nodes, "
-                f"{parse['manual_block_decompression']['successful_blocks']} block payloads decompressed"
+                f"{parse['manual_block_decompression']['decrypted_successful_blocks']} decrypted block payloads decompressed"
             )
         print(f"{Path(item['bundle_path']).name}: {summary}")
     return 0
