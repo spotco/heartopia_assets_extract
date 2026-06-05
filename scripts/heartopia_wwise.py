@@ -17,6 +17,33 @@ _BANK_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"music", re.IGNORECASE), "music_named_bank"),
 ]
 
+_GENERIC_TITLES = {
+    "mus_map",
+    "amb_general",
+    "music",
+    "mus_ui",
+}
+
+_LABEL_KIND_PRIORITY = (
+    "timeline_music",
+    "bridge_music",
+    "instrument_theme_music",
+    "ui_music",
+    "map_music",
+    "general_ambience",
+    "music_named_bank",
+)
+
+_LABEL_PREFIX_BY_KIND = {
+    "timeline_music": "timeline_music",
+    "bridge_music": "bridge_music",
+    "instrument_theme_music": "instrument_theme_music",
+    "ui_music": "ui_music",
+    "map_music": "map_music",
+    "general_ambience": "general_ambience",
+    "music_named_bank": "music",
+}
+
 
 def default_bank_root(game_root: Path | None = None) -> Path:
     root = (game_root or DEFAULT_GAME_ROOT).resolve()
@@ -145,3 +172,22 @@ def choose_title(bank_names: list[str]) -> str:
         return unique[0]
     unique.sort(key=lambda item: (item.lower().startswith("amb_"), len(item), item))
     return "__".join(unique[:4]) + ("__multiple" if len(unique) > 4 else "")
+
+
+def is_generic_title(title: str) -> bool:
+    return sanitize(title).lower() in _GENERIC_TITLES
+
+
+def fallback_label_prefix(bank_types: list[str]) -> str:
+    kinds = set(bank_types)
+    for kind in _LABEL_KIND_PRIORITY:
+        if kind in kinds:
+            return _LABEL_PREFIX_BY_KIND[kind]
+    return "music"
+
+
+def build_music_label(title: str, bank_types: list[str], media_id: int) -> tuple[str, str]:
+    normalized = sanitize(title)
+    if normalized and not is_generic_title(normalized):
+        return normalized, "specific_bank_name"
+    return f"{fallback_label_prefix(bank_types)}_{media_id}", "generic_bank_type_media_id"

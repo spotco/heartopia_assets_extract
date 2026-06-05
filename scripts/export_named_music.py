@@ -146,6 +146,8 @@ def main() -> int:
         "source_kind",
         "source_path",
         "confidence",
+        "raw_title",
+        "label_strategy",
         "suggested_title",
         "suggested_filename",
         "bank_names",

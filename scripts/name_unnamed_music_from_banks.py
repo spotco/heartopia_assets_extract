@@ -8,6 +8,7 @@ from pathlib import Path
 
 from heartopia_wwise import (
     DEFAULT_GAME_ROOT,
+    build_music_label,
     choose_title,
     classify_bank,
     decode_bank_if_needed,
@@ -103,7 +104,8 @@ def main() -> int:
     for media_id in sorted(media_to_banks):
         bank_names = sorted(media_to_banks[media_id])
         bank_types = sorted(bank_type_by_media[media_id])
-        title = choose_title(bank_names)
+        raw_title = choose_title(bank_names)
+        title, label_strategy = build_music_label(raw_title, bank_types, media_id)
         loose = sorted(loose_paths.get(media_id, []))
         extracted = sorted(extracted_paths.get(media_id, []))
         absolute_extracted = sorted(extracted_absolute_paths.get(media_id, []))
@@ -134,6 +136,8 @@ def main() -> int:
                 "embedded_relative_paths": "|".join(extracted),
                 "bank_names": "|".join(bank_names),
                 "bank_types": "|".join(bank_types),
+                "raw_title": raw_title,
+                "label_strategy": label_strategy,
                 "suggested_title": title,
                 "suggested_filename": f"{title}__{media_id}.wem" if title else "",
                 "confidence": confidence,
@@ -153,6 +157,8 @@ def main() -> int:
                 "source_kind",
                 "source_path",
                 "confidence",
+                "raw_title",
+                "label_strategy",
                 "suggested_title",
                 "suggested_filename",
                 "bank_types",
@@ -181,7 +187,7 @@ def main() -> int:
             handle.write(f"  {key}: {count}\n")
         handle.write("\nNotes:\n")
         handle.write("1. Heartopia ships plain BKHD banks and plain RIFF WEM files, so Sword's XOR-decoding path is preserved but usually unused.\n")
-        handle.write("2. No SoundBanksInfo/XML or exported event-name manifest was found in the install, so the primary human-readable source is the bank filename itself.\n")
+        handle.write("2. No SoundBanksInfo/XML or exported event-name manifest was found in the install, so labels come from bank filenames when possible and fall back to stable bank-type-plus-media-id labels for generic banks.\n")
         handle.write("3. Most clearly named music appears to be embedded in DIDX/DATA chunks inside music-related banks, so extraction is required before conversion.\n")
         handle.write("4. HIRC scanning is only used here to catch loose WEM ids referenced by music banks without direct DIDX entries.\n")
 
